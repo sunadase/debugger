@@ -57,5 +57,24 @@ https://man7.org/linux/man-pages/man3/backtrace.3.html
 how to find main
 - with and without file analysis?
 
+one doc i read had said that main is at *rdi(first arg) just before __libc_start_main call
+
+
+
 is the elf/bin analysis only way to find func names
+
+aslr?
+
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1
+
+https://reverseengineering.stackexchange.com/questions/21119/how-do-tools-like-objdump-find-names-of-functions-and-their-start-address-in-elf
+
+
+
+
+
+
+
+
 
