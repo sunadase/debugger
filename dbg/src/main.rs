@@ -57,19 +57,21 @@ where
         match *meta.level() {
             Level::TRACE => write!(&mut writer, "{}: ", Color::Purple.paint("TRACE")),
             Level::DEBUG => write!(&mut writer, "{}: ", Color::Blue.paint("DEBUG")),
-            Level::INFO => write!(&mut writer, "{}: ", Color::Green.paint("INFO")),
-            Level::WARN => write!(&mut writer, "{}: ", Color::Yellow.paint("WARN")),
+            Level::INFO => write!(&mut writer, "{}: ", Color::Green.paint(" INFO")),
+            Level::WARN => write!(&mut writer, "{}: ", Color::Yellow.paint(" WARN")),
             Level::ERROR => write!(&mut writer, "{}: ", Color::Red.paint("ERROR")),
         }?;
 
         let current_thread = std::thread::current();
-        match current_thread.name() {
-            Some(name) => {
-                write!(writer, "{} ", FmtThreadName::new(name))?;
-            }
-            _ => {}
+        // match current_thread.name() {
+        //     Some(name) => {
+        //         write!(writer, "{} ", FmtThreadName::new(name))?;
+        //     }
+        //     _ => {}
+        // }
+        if let Some((_, thrd)) = format!("{:0>2?}",current_thread.id()).split_once("("){
+            write!(writer, "T({} ", thrd)?;
         }
-        write!(writer, "{:0>2?} ", current_thread.id())?;
 
         // Format all the spans in the event's span context.
         if let Some(scope) = ctx.event_scope() {
@@ -92,14 +94,65 @@ where
                     write!(writer, "{{{}}}", fields)?;
                 }
 
-                write!(writer, ": ")?;
+                write!(writer, ":")?;
             }
         }
+        write!(writer, " ")?;
 
         // Write fields on the event
         ctx.field_format().format_fields(writer.by_ref(), event)?;
 
         writeln!(writer)
+    }
+}
+
+fn child_runner(path: &PathBuf) {
+    debug!("Forked, child. pid: {}, ppid: {}", getpid(), getppid());
+    ptrace::traceme();
+    debug!("Ran traceme from child");
+    Command::new(path).exec();
+    debug!("executed the program at child");
+    exit(1);
+}
+
+fn parent_runner(repl: &mut REPL, child: Pid) {
+    loop {
+        if !&repl.wait {
+            ptrace::getregs(child).and_then(|regs| {
+                info!("{:x?}", regs);
+                Ok(())
+            });
+
+            match &repl.rep() {
+                Err(e) => {
+                    println!("REPL errd with {}", e)
+                }
+                _ => {}
+            }
+        } else {
+            match nix::sys::wait::wait() {
+                Ok(wstatus) => {
+                    debug!("{:?}", wstatus);
+                    ptrace::getregs(child).and_then(|regs| {
+                        info!("{:x?}", regs);
+                        debug!("checking bps..");
+                        repl.check_breakpoints(regs);
+                        Ok(())
+                    });
+
+                    match &repl.rep() {
+                        Err(e) => {
+                            println!("REPL errd with {}", e);
+                            repl.wait = false;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    error!("wait() errored with {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -146,64 +199,18 @@ fn main() {
                 match unsafe {nix::unistd::fork()} {
                     Ok(ForkResult::Child) => {
                         span!(Level::DEBUG, ">[CHILD]").in_scope(||{
-                            debug!("Forked, child. pid: {}, ppid: {}", getpid(), getppid());
-                            ptrace::traceme();
-                            debug!("Ran traceme from child");
-                            Command::new(path).exec();
-                            debug!("executed the program at child");
-                            exit(1);
+                            child_runner(&path);
                         });
                     }
                     Ok(ForkResult::Parent { child }) => {
                         span!(Level::DEBUG, "[PARENT]").in_scope(||{
                             debug!("Forked, parent. pid: {}, ppid: {}", getpid(), getppid());
                             ptrace::attach(child);
-
                             debug!("attached to child @ {}", child);
 
                             let mut repl = REPL::new(child);
 
-                            loop {
-                                if !&repl.wait{
-                                    ptrace::getregs(child).and_then(|regs|{
-                                        info!("{:x?}", regs);
-                                        Ok(())
-                                    });
-
-                                    match &repl.rep() {
-                                        Err(e) => {
-                                            println!("REPL errd with {}", e)
-                                        }
-                                        _ => {}
-                                    }
-                                } else {
-                                    match nix::sys::wait::wait(){
-                                        Ok(wstatus) => {
-                                            debug!("{:?}", wstatus);                           
-                                            ptrace::getregs(child).and_then(|regs|{
-                                                info!("{:x?}", regs);
-                                                debug!("checking bps..");
-                                                repl.check_breakpoints(regs);
-                                                Ok(())
-                                            });
-                                            
-
-                                            match &repl.rep() {
-                                                Err(e) => {
-                                                    println!("REPL errd with {}", e);
-                                                    repl.wait = false;
-                                                }
-                                                _ => {}
-                                            }
-
-                                        },
-                                        Err(e) => {
-                                            error!("wait() errored with {}", e);
-                                        }
-                                    }
-                                }
-                            }
-
+                            parent_runner(&mut repl, child);
                         });
                     }
                     Err(e) => {}
@@ -498,7 +505,7 @@ impl REPL {
             return;
         }
         debug!("rip: 0x{:x}", registers.rip);
-        // int3 signals just after rip reaches addr? 
+        // int3 signals just after rip reaches addr?
         // so we are just 1 after bp
         let bp = (registers.rip - 1) as usize;
         debug!(" bp: 0x{:x}", bp);
@@ -507,16 +514,17 @@ impl REPL {
         if let Some(old_ins) = self.breakpoints.remove(bp.borrow()) {
             info!("hit breakpoint: {:x}, replacing old_ins {:x}", bp, old_ins);
             let ins_bp = ptrace::read(self.pid, bp as *mut c_void).unwrap_or(0) as usize;
-            let ins_rip = ptrace::read(self.pid, registers.rip as *mut c_void).unwrap_or(0) as usize;
+            let ins_rip =
+                ptrace::read(self.pid, registers.rip as *mut c_void).unwrap_or(0) as usize;
             debug!(" bp: @0x{:x} -> 0x{:x}", bp, ins_bp);
             debug!("rip: @0x{:x} -> 0x{:x}", registers.rip, ins_rip);
             if let Ok(instructions) = read_words(self.pid, bp as usize, 9) {
                 debug!("next instructions from current bp, rip:");
                 for (addr, ins) in instructions {
                     let name = match addr {
-                        _ if addr == registers.rip as usize => {"< rip"},
-                        _ if addr == bp as usize => {"< bp"},
-                        _ => {""}
+                        _ if addr == registers.rip as usize => "< rip",
+                        _ if addr == bp as usize => "< bp",
+                        _ => "",
                     };
                     debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
                 }
@@ -535,9 +543,9 @@ impl REPL {
                 debug!("next instructions from current rip after replacement:");
                 for (addr, ins) in instructions {
                     let name = match addr {
-                        _ if addr == registers.rip as usize => {"< rip"},
-                        _ if addr == bp as usize => {"< bp"},
-                        _ => {""}
+                        _ if addr == registers.rip as usize => "< rip",
+                        _ if addr == bp as usize => "< bp",
+                        _ => "",
                     };
                     debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
                 }
