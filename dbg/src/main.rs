@@ -3,7 +3,8 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     error::Error,
-    fs, io::{self, Write},
+    fs,
+    io::{self, Write},
     os::{
         self,
         raw::c_void,
@@ -491,9 +492,9 @@ impl REPL {
 
     fn check_breakpoints(&mut self, registers: &user_regs_struct) {
         debug!("within check bp");
-        if self.breakpoints.len() == 0 { 
+        if self.breakpoints.len() == 0 {
             debug!("nothing to check bps empty");
-            return 
+            return;
         }
         // int3 signals before rip reaches addr? so we move one step ?further?
         let bp = (registers.rip - 1) as usize;
