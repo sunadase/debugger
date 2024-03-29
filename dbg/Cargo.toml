@@ -9,6 +9,7 @@ edition = "2021"
 clap = "4.5.4"
 nix = { version = "0.28.0", features = ["process", "ptrace"] }
 nu-ansi-term = "0.50.0"
+serde = { version = "1.0.197", features = ["derive"] }
 tracing = "0.1.40"
 tracing-core = "0.1.32"
 tracing-log = "0.2.0"

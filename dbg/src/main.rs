@@ -21,6 +21,7 @@ use nix::{
     unistd::{getpid, getppid, ForkResult, Pid},
 };
 use nu_ansi_term::Color;
+use serde::{Deserialize, Serialize};
 use tracing::{
     debug, error, field::debug, instrument::WithSubscriber, level_filters::LevelFilter, span,
     Level, Subscriber, Value,
@@ -165,7 +166,7 @@ fn main() {
                             loop {
                                 if !&repl.wait{
                                     ptrace::getregs(child).and_then(|regs|{
-                                        info!("{:?}", regs);
+                                        info!("{:x?}", regs);
                                         Ok(())
                                     });
 
@@ -180,9 +181,9 @@ fn main() {
                                         Ok(wstatus) => {
                                             debug!("{:?}", wstatus);                           
                                             ptrace::getregs(child).and_then(|regs|{
-                                                info!("{:?}", regs);
+                                                info!("{:x?}", regs);
                                                 debug!("checking bps..");
-                                                repl.check_breakpoints(&regs);
+                                                repl.check_breakpoints(regs);
                                                 Ok(())
                                             });
                                             
@@ -490,22 +491,34 @@ impl REPL {
             .and_then(|input| self.parse_input(&input).and_then(|cmd| self.call_cmds(cmd)));
     }
 
-    fn check_breakpoints(&mut self, registers: &user_regs_struct) {
+    fn check_breakpoints(&mut self, mut registers: user_regs_struct) {
         debug!("within check bp");
         if self.breakpoints.len() == 0 {
             debug!("nothing to check bps empty");
             return;
         }
-        // int3 signals before rip reaches addr? so we move one step ?further?
+        debug!("rip: 0x{:x}", registers.rip);
+        // int3 signals just after rip reaches addr? 
+        // so we are just 1 after bp
         let bp = (registers.rip - 1) as usize;
+        debug!(" bp: 0x{:x}", bp);
 
         // we got the signal and reached the bp so we place the old instruction back
         if let Some(old_ins) = self.breakpoints.remove(bp.borrow()) {
-            info!("hit breakpoint: {:x}, replacing old_ins{:?}", bp, old_ins);
-            if let Ok(instructions) = read_words(self.pid, registers.rip as usize, 8) {
-                debug!("next instructions from current rip:");
+            info!("hit breakpoint: {:x}, replacing old_ins {:x}", bp, old_ins);
+            let ins_bp = ptrace::read(self.pid, bp as *mut c_void).unwrap_or(0) as usize;
+            let ins_rip = ptrace::read(self.pid, registers.rip as *mut c_void).unwrap_or(0) as usize;
+            debug!(" bp: @0x{:x} -> 0x{:x}", bp, ins_bp);
+            debug!("rip: @0x{:x} -> 0x{:x}", registers.rip, ins_rip);
+            if let Ok(instructions) = read_words(self.pid, bp as usize, 9) {
+                debug!("next instructions from current bp, rip:");
                 for (addr, ins) in instructions {
-                    debug!("@[0x{:x}]> 0x{:x}", addr, ins);
+                    let name = match addr {
+                        _ if addr == registers.rip as usize => {"< rip"},
+                        _ if addr == bp as usize => {"< bp"},
+                        _ => {""}
+                    };
+                    debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
                 }
             }
 
@@ -514,11 +527,19 @@ impl REPL {
             }
 
             //post rip state seem to be wrong? rip not inc in prints?
+            // bcuz we need to move/update rip 1 back
+            registers.rip = bp as u64;
+            ptrace::setregs(self.pid, registers.to_owned());
 
-            if let Ok(instructions) = read_words(self.pid, registers.rip as usize, 8) {
+            if let Ok(instructions) = read_words(self.pid, bp as usize, 9) {
                 debug!("next instructions from current rip after replacement:");
                 for (addr, ins) in instructions {
-                    debug!("@[0x{:x}]> 0x{:x}", addr, ins);
+                    let name = match addr {
+                        _ if addr == registers.rip as usize => {"< rip"},
+                        _ if addr == bp as usize => {"< bp"},
+                        _ => {""}
+                    };
+                    debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
                 }
             }
         }
