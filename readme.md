@@ -10,3 +10,21 @@ missing:
 - check bugs and sketchy impls
 - move runners inside fork parent and child into their own funcs : brackets too deep
 - didnt disable aslr - so what?
+
+
+usage:
+
+```
+app /path
+cargo run -- /path
+cargo run --bin dbg -- /path
+
+repl cmds:
+pmap
+si
+ins
+bp
+c
+st
+mem ?fails bcause stack is empty or something else?
+```
