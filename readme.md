@@ -8,3 +8,4 @@ missing:
 - attach directly to an active process pid
 - instruction translation????
 - check bugs and sketchy impls
+- move runners inside fork parent and child into their own funcs : brackets too deep
