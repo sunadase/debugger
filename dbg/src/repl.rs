@@ -1,6 +1,6 @@
 use clap::builder::Str;
-use nix::{libc::user_regs_struct, sys::ptrace, unistd::Pid};
 use core::fmt;
+use nix::{libc::user_regs_struct, sys::ptrace, unistd::Pid};
 use std::{
     borrow::Borrow,
     collections::HashMap,
@@ -228,9 +228,11 @@ impl REPL {
     }
 
     pub fn rep(&mut self) -> Result<(), Errors> {
-        return REPL::get_input().map_err(Errors::Io)
-            .and_then(|input| self.parse_input(&input).map_err(Errors::Text)
-            .and_then(|cmd| self.call_cmds(cmd)));
+        return REPL::get_input().map_err(Errors::Io).and_then(|input| {
+            self.parse_input(&input)
+                .map_err(Errors::Text)
+                .and_then(|cmd| self.call_cmds(cmd))
+        });
     }
 
     pub fn check_breakpoints(&mut self, mut registers: user_regs_struct) {
@@ -324,33 +326,38 @@ impl REPL {
 pub enum Errors {
     Io(io::Error),
     Text(String),
-    Errno(nix::errno::Errno)
+    Errno(nix::errno::Errno),
 }
 
 impl fmt::Display for Errors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Errors::Errno(ref err) => {write!(f, "Errno: {}", err)},
-            Errors::Text(ref err) => {write!(f, "Err: {}", err)},
-            Errors::Io(ref err) => {write!(f, "IO error: {}", err)},
-        } 
+            Errors::Errno(ref err) => {
+                write!(f, "Errno: {}", err)
+            }
+            Errors::Text(ref err) => {
+                write!(f, "Err: {}", err)
+            }
+            Errors::Io(ref err) => {
+                write!(f, "IO error: {}", err)
+            }
+        }
     }
 }
 
 impl From<io::Error> for Errors {
     fn from(value: io::Error) -> Self {
-        return Errors::Io(value)
+        return Errors::Io(value);
     }
 }
 impl From<String> for Errors {
     fn from(value: String) -> Self {
-        return Errors::Text(value)
+        return Errors::Text(value);
     }
 }
 
 impl From<nix::errno::Errno> for Errors {
     fn from(value: nix::errno::Errno) -> Self {
-        return Errors::Errno(value)
+        return Errors::Errno(value);
     }
 }
-
