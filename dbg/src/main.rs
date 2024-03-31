@@ -1,110 +1,20 @@
-use core::fmt;
+use clap::{self, Arg};
+use nix::sys::ptrace;
+use nix::unistd::{getpid, getppid, ForkResult, Pid};
 use std::{
-    borrow::Borrow,
-    collections::HashMap,
     error::Error,
-    fs,
-    io::{self, Write},
-    os::{
-        self,
-        raw::c_void,
-        unix::{fs::PermissionsExt, process::CommandExt},
-    },
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{exit, Command},
 };
+use tracing::{debug, error, level_filters::LevelFilter, span, Level};
+use tracing_log::log::info;
+use tracing_subscriber::EnvFilter;
 
-use clap::{self, builder::Str, Arg};
-use nix::{
-    libc::{ptrace, user_regs_struct},
-    sys::wait::wait,
-    unistd::{getpid, getppid, ForkResult, Pid},
-};
-use nu_ansi_term::Color;
-use serde::{Deserialize, Serialize};
-use tracing::{
-    debug, error, field::debug, instrument::WithSubscriber, level_filters::LevelFilter, span,
-    Level, Subscriber, Value,
-};
-use tracing_subscriber::{
-    fmt::{format, FormatEvent, FormatFields, FormattedFields},
-    registry::LookupSpan,
-    EnvFilter,
-};
-
-use tracing_core::Event;
-
-use tracing_log::{log::info, NormalizeEvent};
-
-use nix::sys::ptrace;
-
-struct MyFormatter;
-
-impl<S, N> FormatEvent<S, N> for MyFormatter
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
-        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> std::fmt::Result {
-        let normalized_meta = event.normalized_metadata();
-        let meta = normalized_meta.as_ref().unwrap_or_else(|| event.metadata());
-
-        match *meta.level() {
-            Level::TRACE => write!(&mut writer, "{}: ", Color::Purple.paint("TRACE")),
-            Level::DEBUG => write!(&mut writer, "{}: ", Color::Blue.paint("DEBUG")),
-            Level::INFO => write!(&mut writer, "{}: ", Color::Green.paint(" INFO")),
-            Level::WARN => write!(&mut writer, "{}: ", Color::Yellow.paint(" WARN")),
-            Level::ERROR => write!(&mut writer, "{}: ", Color::Red.paint("ERROR")),
-        }?;
-
-        let current_thread = std::thread::current();
-        // match current_thread.name() {
-        //     Some(name) => {
-        //         write!(writer, "{} ", FmtThreadName::new(name))?;
-        //     }
-        //     _ => {}
-        // }
-        if let Some((_, thrd)) = format!("{:0>2?}",current_thread.id()).split_once("("){
-            write!(writer, "T({} ", thrd)?;
-        }
-
-        // Format all the spans in the event's span context.
-        if let Some(scope) = ctx.event_scope() {
-            write!(writer, "({} > {}) ", getppid(), getpid());
-            for span in scope.from_root() {
-                write!(writer, "{}", span.name())?;
-
-                // `FormattedFields` is a formatted representation of the span's
-                // fields, which is stored in its extensions by the `fmt` layer's
-                // `new_span` method. The fields will have been formatted
-                // by the same field formatter that's provided to the event
-                // formatter in the `FmtContext`.
-                let ext = span.extensions();
-                let fields = &ext
-                    .get::<FormattedFields<N>>()
-                    .expect("will never be `None`");
-
-                // Skip formatting the fields if the span had no fields.
-                if !fields.is_empty() {
-                    write!(writer, "{{{}}}", fields)?;
-                }
-
-                write!(writer, ":")?;
-            }
-        }
-        write!(writer, " ")?;
-
-        // Write fields on the event
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-
-        writeln!(writer)
-    }
-}
+mod repl;
+mod tracing_formatter;
+use repl::REPL;
+use tracing_formatter::MyFormatter;
 
 fn child_runner(path: &PathBuf) {
     debug!("Forked, child. pid: {}, ppid: {}", getpid(), getppid());
@@ -125,7 +35,7 @@ fn parent_runner(repl: &mut REPL, child: Pid) {
 
             match &repl.rep() {
                 Err(e) => {
-                    println!("REPL errd with {}", e)
+                    error!("REPL errd with {}", e)
                 }
                 _ => {}
             }
@@ -142,7 +52,7 @@ fn parent_runner(repl: &mut REPL, child: Pid) {
 
                     match &repl.rep() {
                         Err(e) => {
-                            println!("REPL errd with {}", e);
+                            error!("REPL errd with {}", e);
                             repl.wait = false;
                         }
                         _ => {}
@@ -247,341 +157,14 @@ fn parse_arg(arg: &String) -> Result<Target, Box<dyn Error>> {
         Some(pid) => return Ok(Target::PID(pid)),
         None => {}
     }
-
     match is_arg_valid_exe(arg) {
         Some(path) => return Ok(Target::Path(path.to_owned())),
         None => {}
     }
-
     return Err(format!("Failed parsing {} as a Path or as a PID", arg).into());
 }
 
 enum Target {
     PID(u16),
     Path(PathBuf),
-}
-
-struct FmtThreadName<'a> {
-    name: &'a str,
-}
-
-impl<'a> FmtThreadName<'a> {
-    pub(crate) fn new(name: &'a str) -> Self {
-        Self { name }
-    }
-}
-
-impl<'a> fmt::Display for FmtThreadName<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use std::sync::atomic::{
-            AtomicUsize,
-            Ordering::{AcqRel, Acquire, Relaxed},
-        };
-
-        // Track the longest thread name length we've seen so far in an atomic,
-        // so that it can be updated by any thread.
-        static MAX_LEN: AtomicUsize = AtomicUsize::new(0);
-        let len = self.name.len();
-        // Snapshot the current max thread name length.
-        let mut max_len = MAX_LEN.load(Relaxed);
-
-        while len > max_len {
-            // Try to set a new max length, if it is still the value we took a
-            // snapshot of.
-            match MAX_LEN.compare_exchange(max_len, len, AcqRel, Acquire) {
-                // We successfully set the new max value
-                Ok(_) => break,
-                // Another thread set a new max value since we last observed
-                // it! It's possible that the new length is actually longer than
-                // ours, so we'll loop again and check whether our length is
-                // still the longest. If not, we'll just use the newer value.
-                Err(actual) => max_len = actual,
-            }
-        }
-
-        // pad thread name using `max_len`
-        write!(f, "{:>width$}", self.name, width = max_len)
-    }
-}
-
-struct REPL {
-    /// active target pid
-    pid: Pid,
-    /// if we're expecting a signal in child: must be set
-    /// false after non ptrace commands since they dont
-    /// induce a signal, repl gets stuck wait()ing a signal
-    wait: bool,
-    ///             bp address, old_instruction
-    breakpoints: HashMap<usize, usize>,
-}
-
-impl REPL {
-    fn new(pid: Pid) -> Self {
-        REPL {
-            pid,
-            wait: true,
-            breakpoints: HashMap::new(),
-        }
-    }
-
-    fn get_input() -> Result<String, Box<dyn Error>> {
-        let mut input = String::new();
-        std::io::stdout().write("> ".as_bytes());
-        std::io::stdout().flush();
-        std::io::stdin().read_line(&mut input)?;
-        Ok(input)
-    }
-
-    fn parse_input(&mut self, input: &String) -> Result<Commands, Box<dyn Error>> {
-        let args: Vec<String> = input
-            .trim()
-            .split_whitespace()
-            .map(|x| x.to_owned())
-            .collect();
-        let cmd = match args.first() {
-            None => return Err("Error parsing cmd".into()),
-            Some(v) => v,
-        };
-        match cmd.as_str() {
-            "mem" | "memory" => {
-                if args.len() > 2 {
-                    return Err("too many arguments for mem command it expects:\nmem (start) (length), ():optional".into());
-                }
-
-                let start = args
-                    .get(1)
-                    .map(|x| x.parse().unwrap_or(0).max(0) as usize)
-                    .unwrap_or(0);
-                //???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-                let length = args.get(2).map(|x| x.parse().unwrap_or(-1)).unwrap_or(-1);
-                self.wait = false;
-                return Ok(Commands::PrintMemory(self.pid.to_owned(), start, length));
-            }
-            "map" | "pmap" => {
-                if args.len() > 2 {
-                    return Err("too many arguments for pmap command it expects:\nmap (start) (length), ():optional".into());
-                }
-
-                let start = args
-                    .get(1)
-                    .map(|x| x.parse().unwrap_or(0).max(0) as usize)
-                    .unwrap_or(0);
-                //???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-                //why does the last unwrap fails without a or/default i thought it was safe??????????????????????????????????????????//
-                let length = args.get(2).map(|x| x.parse().unwrap_or(-1)).unwrap_or(-1);
-                self.wait = false;
-                return Ok(Commands::PrintMemoryMap(self.pid.to_owned(), start, length));
-            }
-            "si" => {
-                self.wait = true;
-                return Ok(Commands::SingleInstruction(self.pid.to_owned()));
-            }
-            "c" | "con" | "cont" => {
-                self.wait = true;
-                return Ok(Commands::Continue(self.pid.to_owned()));
-            }
-            "bp" | "b" => {
-                if let Some(addr) = args.get(1) {
-                    let hex = addr[2..].to_owned();
-                    debug!("{} : {}", addr, hex);
-                    match usize::from_str_radix(&hex, 16) {
-                        Ok(parsed) => {
-                            debug!("parsed {} into {:x}", addr, parsed);
-                            self.wait = false;
-                            return Ok(Commands::Breakpoint(self.pid.to_owned(), parsed));
-                        }
-                        Err(e) => Err(format!(
-                            "Failed parsing {} as a hex string. expected: bp 0x1337",
-                            addr
-                        )
-                        .into()),
-                    }
-                } else {
-                    return Err("Failed parsing addr for breakpoint. expected: bp 0x1337".into());
-                }
-            }
-            "st" | "state" => {
-                self.wait = false;
-                return Ok(Commands::State(self.pid.to_owned()));
-            }
-            "ins" | "i" => {
-                if args.len() > 1 {
-                    return Err(
-                        "Got too many args for ins. Expected ins (number): ():optional".into(),
-                    );
-                }
-                let size = args
-                    .get(1)
-                    .map(|x| x.parse::<usize>().unwrap_or(8))
-                    .unwrap_or(8 as usize);
-                self.wait = false;
-                return Ok(Commands::Instructions(self.pid.to_owned(), size));
-            }
-            _ => Err(format!("Error parsing input into a command").into()),
-        }
-    }
-
-    fn call_cmds(&mut self, cmd: Commands) -> Result<(), Box<dyn Error>> {
-        match cmd {
-            Commands::PrintMemory(pid, start, length) => {
-                let mem = get_mem(pid)?;
-                let lines: Vec<&str> = mem.lines().collect();
-                let end;
-                if length < 0 {
-                    end = lines.len();
-                } else {
-                    end = start + (length as usize).min(lines.len());
-                }
-                for line in lines.as_slice()[start..end].iter() {
-                    println!("{}", line);
-                }
-                Ok(())
-            }
-            Commands::PrintMemoryMap(pid, start, length) => {
-                let map = get_pmap(pid)?;
-                let lines: Vec<&str> = map.lines().collect();
-                let end;
-                if length < 0 {
-                    end = lines.len();
-                } else {
-                    end = start + (length as usize).min(lines.len());
-                }
-                for line in lines.as_slice()[start..end].iter() {
-                    println!("{}", line);
-                }
-                Ok(())
-            }
-            Commands::Continue(pid) => {
-                ptrace::cont(pid, None);
-                Ok(())
-            }
-            Commands::SingleInstruction(pid) => {
-                ptrace::step(pid, None);
-                Ok(())
-            }
-            Commands::Breakpoint(pid, addr) => {
-                let old_ins = ptrace::read(pid, addr as *mut c_void)? as usize;
-                self.breakpoints.insert(addr, old_ins);
-                //overwrites on repeat?
-                unsafe {
-                    ptrace::write(
-                        pid,
-                        addr as *mut c_void,
-                        (old_ins & (usize::MAX - 0xff) | 0xcc) as *mut c_void,
-                    );
-                }
-                Ok(())
-            }
-            Commands::State(pid) => {
-                let rsp = ptrace::getregs(pid)?.rsp;
-                let words = read_words(pid, rsp as usize, 16)?;
-                for (addr, ins) in words {
-                    debug!("@[0x{:x}]> 0x{:x}", addr, ins);
-                }
-                Ok(())
-            }
-            Commands::Instructions(pid, size) => {
-                let rip = ptrace::getregs(pid)?.rip;
-                if let Ok(instructions) = read_words(self.pid, rip as usize, size) {
-                    info!("next {} instructions:", size);
-                    for (addr, ins) in instructions {
-                        info!("@[0x{:x}]> 0x{:x}", addr, ins);
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn rep(&mut self) -> Result<(), Box<dyn Error>> {
-        return REPL::get_input()
-            .and_then(|input| self.parse_input(&input).and_then(|cmd| self.call_cmds(cmd)));
-    }
-
-    fn check_breakpoints(&mut self, mut registers: user_regs_struct) {
-        debug!("within check bp");
-        if self.breakpoints.len() == 0 {
-            debug!("nothing to check bps empty");
-            return;
-        }
-        debug!("rip: 0x{:x}", registers.rip);
-        // int3 signals just after rip reaches addr?
-        // so we are just 1 after bp
-        let bp = (registers.rip - 1) as usize;
-        debug!(" bp: 0x{:x}", bp);
-
-        // we got the signal and reached the bp so we place the old instruction back
-        if let Some(old_ins) = self.breakpoints.remove(bp.borrow()) {
-            info!("hit breakpoint: {:x}, replacing old_ins {:x}", bp, old_ins);
-            let ins_bp = ptrace::read(self.pid, bp as *mut c_void).unwrap_or(0) as usize;
-            let ins_rip =
-                ptrace::read(self.pid, registers.rip as *mut c_void).unwrap_or(0) as usize;
-            debug!(" bp: @0x{:x} -> 0x{:x}", bp, ins_bp);
-            debug!("rip: @0x{:x} -> 0x{:x}", registers.rip, ins_rip);
-            if let Ok(instructions) = read_words(self.pid, bp as usize, 9) {
-                debug!("next instructions from current bp, rip:");
-                for (addr, ins) in instructions {
-                    let name = match addr {
-                        _ if addr == registers.rip as usize => "< rip",
-                        _ if addr == bp as usize => "< bp",
-                        _ => "",
-                    };
-                    debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
-                }
-            }
-
-            unsafe {
-                ptrace::write(self.pid, bp as *mut c_void, old_ins as *mut c_void);
-            }
-
-            //post rip state seem to be wrong? rip not inc in prints?
-            // bcuz we need to move/update rip 1 back
-            registers.rip = bp as u64;
-            ptrace::setregs(self.pid, registers.to_owned());
-
-            if let Ok(instructions) = read_words(self.pid, bp as usize, 9) {
-                debug!("next instructions from current rip after replacement:");
-                for (addr, ins) in instructions {
-                    let name = match addr {
-                        _ if addr == registers.rip as usize => "< rip",
-                        _ if addr == bp as usize => "< bp",
-                        _ => "",
-                    };
-                    debug!("@[0x{:x}]> 0x{:x} {}", addr, ins, name);
-                }
-            }
-        }
-
-        debug!("finished check bp");
-    }
-}
-
-enum Commands {
-    PrintMemory(Pid, usize, i32),
-    PrintMemoryMap(Pid, usize, i32),
-    SingleInstruction(Pid),
-    Continue(Pid),
-    Breakpoint(Pid, usize),
-    State(Pid),
-    Instructions(Pid, usize),
-}
-
-fn get_pmap(pid: Pid) -> Result<String, io::Error> {
-    let path = format!("/proc/{}/maps", pid);
-    return fs::read_to_string(path);
-}
-
-fn get_mem(pid: Pid) -> Result<String, io::Error> {
-    let path = format!("/proc/{}/mem", pid);
-    return fs::read_to_string(path);
-}
-
-fn read_words(pid: Pid, from: usize, size: usize) -> Result<Vec<(usize, usize)>, Box<dyn Error>> {
-    let mut words = Vec::with_capacity(size);
-    let wordlen = std::mem::size_of::<usize>();
-    for i in 0..size {
-        let addr = from + (wordlen * i);
-        words.push((addr, ptrace::read(pid, addr as *mut c_void)? as usize));
-    }
-    return Ok(words);
 }
